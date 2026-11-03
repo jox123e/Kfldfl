@@ -262,14 +262,15 @@ const handler = createMcpHandler(
             responseData = responseText.slice(0, 12000);
           }
 
-          return textResult(JSON.stringify({
+          const serialized = JSON.stringify({
             ok: response.ok,
             status: response.status,
             statusText: response.statusText,
             url: target.toString(),
             method,
             data: responseData,
-          }));
+          });
+          return textResult(serialized.length > 16000 ? serialized.slice(0, 16000) + "… [respuesta truncada]" : serialized);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return textResult("Error al llamar la API de Roblox: " + message);
@@ -292,7 +293,7 @@ const handler = createMcpHandler(
         "También se indicaron permisos legacy para assets, badges, developer-products, game-passes, groups, universes y users.",
         "",
         "Usa roblox_api_request para llamar los endpoints oficiales. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
-      ].join("\\n"))
+      ].join("\n"))
     );
   },
   {},
