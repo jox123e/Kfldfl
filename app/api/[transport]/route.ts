@@ -196,6 +196,115 @@ const handler = createMcpHandler(
     );
 
     server.tool(
+      "upload_model_asset",
+      "Crea un asset Model en Roblox usando Assets Open Cloud. Admite .rbxm y .rbxmx de hasta 10 MiB por file_url HTTPS público o 3 MiB por file_base64. Crea el asset a nombre de un usuario o grupo y devuelve operationId para consultar el procesamiento con roblox_asset_operation. No publica una Place.",
+      {
+        file_name: z.string().min(1).max(255).regex(/\.(rbxm|rbxmx)$/i),
+        file_base64: z.string().min(1).optional(),
+        file_url: z.string().url().optional(),
+        display_name: z.string().min(1).max(50),
+        description: z.string().max(1000).default(""),
+        creator_user_id: z.string().regex(/^\d+$/).optional(),
+        creator_group_id: z.string().regex(/^\d+$/).optional(),
+      },
+      async ({ file_name, file_base64, file_url, display_name, description, creator_user_id, creator_group_id }) => {
+        try {
+          const apiKey = process.env.ROBLOX_API_KEY;
+          if (!apiKey) return textResult("Falta configurar ROBLOX_API_KEY en Vercel.");
+          if (Boolean(creator_user_id) === Boolean(creator_group_id)) {
+            return textResult("Debes indicar exactamente uno: creator_user_id o creator_group_id.");
+          }
+          if (Boolean(file_base64) === Boolean(file_url)) {
+            return textResult("Debes proporcionar exactamente uno: file_base64 o file_url.");
+          }
+          let bytes: Uint8Array;
+          if (file_url) {
+            bytes = await downloadPlaceFile(file_url);
+          } else {
+            const maxInlineBytes = 3 * 1024 * 1024;
+            if (file_base64!.length > Math.ceil((maxInlineBytes * 4) / 3) + 8 ||
+                !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64!) ||
+                file_base64!.length % 4 !== 0) {
+              return textResult("file_base64 no es válido o supera el límite de 3 MiB. Usa file_url para archivos mayores.");
+            }
+            bytes = new Uint8Array(Buffer.from(file_base64!, "base64"));
+            if (!bytes.byteLength || bytes.byteLength > maxInlineBytes) {
+              return textResult("El archivo debe pesar entre 1 byte y 3 MiB usando file_base64.");
+            }
+          }
+          const name = file_name.toLowerCase();
+          if (name.endsWith(".rbxmx")) {
+            const prefix = new TextDecoder().decode(bytes.slice(0, 512)).replace(/^\uFEFF/, "").trimStart();
+            if (!prefix.startsWith("<?xml") && !prefix.startsWith("<roblox")) {
+              return textResult("El archivo .rbxmx no parece ser XML de Roblox.");
+            }
+          }
+          const creationContext = {
+            creator: creator_user_id ? { userId: creator_user_id } : { groupId: creator_group_id },
+          };
+          const form = new FormData();
+          form.append("request", JSON.stringify({
+            assetType: "Model",
+            displayName: display_name,
+            description,
+            creationContext,
+          }));
+          form.append("fileContent", new Blob([new Uint8Array(bytes)], { type: "model/x-rbxm" }), file_name);
+          const response = await fetch("https://apis.roblox.com/assets/v1/assets", {
+            method: "POST",
+            headers: { "x-api-key": apiKey, "Accept": "application/json" },
+            body: form,
+            redirect: "error",
+            cache: "no-store",
+            signal: AbortSignal.timeout(45000),
+          });
+          const responseText = await response.text();
+          let data: any;
+          try { data = responseText ? JSON.parse(responseText) : null; }
+          catch { data = responseText.slice(0, 4000); }
+          if (!response.ok) {
+            return textResult(JSON.stringify({ ok: false, status: response.status, data }));
+          }
+          return textResult(JSON.stringify({
+            ok: true,
+            status: response.status,
+            fileName: file_name,
+            sizeBytes: bytes.byteLength,
+            assetType: "Model",
+            operation: data,
+            note: "La creación es asíncrona. Consulta operationId con roblox_asset_operation hasta que finalice.",
+          }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return textResult("No se pudo crear el modelo: " + message);
+        }
+      }
+    );
+
+    server.tool(
+      "roblox_asset_operation",
+      "Consulta el estado y resultado de una operación de creación o actualización de Assets Open Cloud mediante su operationId.",
+      { operation_id: z.string().min(1).max(200) },
+      async ({ operation_id }) => {
+        try {
+          const apiKey = process.env.ROBLOX_API_KEY;
+          if (!apiKey) return textResult("Falta configurar ROBLOX_API_KEY en Vercel.");
+          const response = await fetch(
+            "https://apis.roblox.com/assets/v1/operations/" + encodeURIComponent(operation_id),
+            { headers: { "x-api-key": apiKey, "Accept": "application/json" }, redirect: "error", cache: "no-store", signal: AbortSignal.timeout(20000) }
+          );
+          const raw = await response.text();
+          let data: unknown;
+          try { data = raw ? JSON.parse(raw) : null; } catch { data = raw.slice(0, 8000); }
+          return textResult(JSON.stringify({ ok: response.ok, status: response.status, data }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return textResult("Error consultando la operación del asset: " + message);
+        }
+      }
+    );
+
+    server.tool(
       "roblox_api_request",
       "Cliente general de Roblox Open Cloud y endpoints oficiales de Roblox. Permite usar los permisos de ROBLOX_API_KEY en APIs de universos, DataStores, Memory Stores, Luau Execution, assets, grupos, usuarios, inventario, mensajería, analíticas, eventos y otros servicios. Solo acepta HTTPS en dominios oficiales roblox.com. Para POST, PUT, PATCH o DELETE debes establecer confirm_write=true.",
       {
@@ -309,7 +418,7 @@ const handler = createMcpHandler(
         "Analíticas y eventos: universe-analytics, universe-analytics-alert, universe-events, studio-evaluations.",
         "También se indicaron permisos legacy para assets, badges, developer-products, game-passes, groups, universes y users.",
         "",
-        "Usa roblox_api_request para llamar los endpoints oficiales. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
+        "Herramientas dedicadas: upload_place (.rbxl/.rbxlx), upload_model_asset (.rbxm/.rbxmx), roblox_asset_operation (seguimiento de carga). roblox_api_request permite explorar otros endpoints oficiales compatibles con API key. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
       ].join("\n"))
     );
   },
