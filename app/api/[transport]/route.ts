@@ -2,6 +2,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { timingSafeEqual } from "node:crypto";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -11,6 +12,54 @@ const MAX_INLINE_BYTES = 3 * 1024 * 1024;
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
+}
+
+async function readBoundedResponse(response: Response, maxBytes: number, label: string): Promise<Uint8Array> {
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new Error(`${label} supera el límite de ${maxBytes} bytes.`);
+  }
+
+  if (!response.body) return new Uint8Array();
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`${label} supera el límite de ${maxBytes} bytes.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function decodeBase64Strict(value: string, maxBytes: number, label: string): Uint8Array {
+  if (!value || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error(`${label}: Base64 inválido.`);
+  }
+  const bytes = Buffer.from(value, "base64");
+  if (!bytes.byteLength || bytes.byteLength > maxBytes || bytes.toString("base64") !== value) {
+    throw new Error(`${label}: el archivo está vacío, supera el límite o tiene Base64 no canónico.`);
+  }
+  return new Uint8Array(bytes);
 }
 
 function isPrivateAddress(address: string): boolean {
@@ -81,28 +130,17 @@ async function downloadPlaceFile(fileUrl: string): Promise<Uint8Array> {
     throw new Error("El archivo supera el límite de 10 MiB.");
   }
 
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  const bytes = await readBoundedResponse(response, MAX_FILE_BYTES, "El archivo descargado");
   if (bytes.byteLength === 0) throw new Error("El archivo descargado está vacío.");
-  if (bytes.byteLength > MAX_FILE_BYTES) {
-    throw new Error("El archivo supera el límite de 10 MiB.");
-  }
   return bytes;
 }
 
 function decodeInlineFile(base64: string): Uint8Array {
-  if (base64.length > Math.ceil((MAX_INLINE_BYTES * 4) / 3) + 8) {
-    throw new Error("Para archivos mayores de 3 MiB, usa file_url con una URL HTTPS pública.");
+  try {
+    return decodeBase64Strict(base64, MAX_INLINE_BYTES, "file_base64");
+  } catch {
+    throw new Error("file_base64 no es válido, está vacío o supera 3 MiB. Usa file_url para archivos mayores.");
   }
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length % 4 !== 0) {
-    throw new Error("file_base64 no contiene Base64 válido.");
-  }
-
-  const bytes = Buffer.from(base64, "base64");
-  if (bytes.byteLength === 0) throw new Error("El archivo está vacío.");
-  if (bytes.byteLength > MAX_INLINE_BYTES) {
-    throw new Error("La carga Base64 está limitada a 3 MiB; usa file_url para archivos mayores.");
-  }
-  return new Uint8Array(bytes);
 }
 
 function validatePlaceFile(fileName: string, bytes: Uint8Array): "application/xml" | "application/octet-stream" {
@@ -221,15 +259,10 @@ const handler = createMcpHandler(
           if (file_url) {
             bytes = await downloadPlaceFile(file_url);
           } else {
-            const maxInlineBytes = 3 * 1024 * 1024;
-            if (file_base64!.length > Math.ceil((maxInlineBytes * 4) / 3) + 8 ||
-                !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64!) ||
-                file_base64!.length % 4 !== 0) {
-              return textResult("file_base64 no es válido o supera el límite de 3 MiB. Usa file_url para archivos mayores.");
-            }
-            bytes = new Uint8Array(Buffer.from(file_base64!, "base64"));
-            if (!bytes.byteLength || bytes.byteLength > maxInlineBytes) {
-              return textResult("El archivo debe pesar entre 1 byte y 3 MiB usando file_base64.");
+            try {
+              bytes = decodeBase64Strict(file_base64!, MAX_INLINE_BYTES, "file_base64");
+            } catch {
+              return textResult("file_base64 no es válido, está vacío o supera 3 MiB. Usa file_url para archivos mayores.");
             }
           }
           const name = file_name.toLowerCase();
@@ -311,10 +344,23 @@ const handler = createMcpHandler(
       const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
       if (!base || !key) throw new Error("Configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en Vercel.");
       const parsed = new URL(base);
-      if (parsed.protocol !== "https:" || !parsed.hostname.endsWith(".supabase.co")) {
-        throw new Error("SUPABASE_URL debe ser el dominio HTTPS oficial del proyecto Supabase.");
+      if (
+        parsed.protocol !== "https:" ||
+        !/^[a-z0-9-]+\.supabase\.co$/i.test(parsed.hostname) ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        (parsed.pathname !== "/" && parsed.pathname !== "") ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        throw new Error("SUPABASE_URL debe ser el origen HTTPS de un proyecto *.supabase.co, sin ruta, credenciales ni parámetros.");
       }
-      return { base: parsed.origin, key, bucket: process.env.SUPABASE_STORAGE_BUCKET || "mcp-files" };
+      const bucket = process.env.SUPABASE_STORAGE_BUCKET?.trim() || "mcp-files";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(bucket)) {
+        throw new Error("SUPABASE_STORAGE_BUCKET contiene un nombre inválido.");
+      }
+      return { base: parsed.origin, key: key.trim(), bucket };
     }
     function safeStoragePath(value: string) {
       const path = value.replace(/^\/+/, "");
@@ -355,11 +401,12 @@ const handler = createMcpHandler(
       async ({ path, file_base64, content_type, overwrite }) => {
         try {
           const clean = safeStoragePath(path);
-          if (file_base64.length > 7 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64) || file_base64.length % 4 !== 0) {
-            return textResult("Base64 inválido o demasiado grande (máximo 5 MiB).");
+          let bytes: Uint8Array;
+          try {
+            bytes = decodeBase64Strict(file_base64, 5 * 1024 * 1024, "file_base64");
+          } catch {
+            return textResult("Base64 inválido, vacío o demasiado grande (máximo 5 MiB).");
           }
-          const bytes = Buffer.from(file_base64, "base64");
-          if (!bytes.length || bytes.length > 5 * 1024 * 1024) return textResult("El archivo debe pesar entre 1 byte y 5 MiB.");
           const cfg = storageConfig();
           const objectPath = clean.split("/").map(encodeURIComponent).join("/");
           const result = await storageRequest("/object/" + encodeURIComponent(cfg.bucket) + "/" + objectPath, {
@@ -386,8 +433,12 @@ const handler = createMcpHandler(
             cache: "no-store", redirect: "error", signal: AbortSignal.timeout(30000),
           });
           if (!response.ok) return textResult("Supabase Storage HTTP " + response.status + ".");
-          const bytes = new Uint8Array(await response.arrayBuffer());
-          if (bytes.byteLength > 3 * 1024 * 1024) return textResult("El archivo supera el límite de descarga MCP de 3 MiB. Usa una URL firmada o descárgalo desde Supabase.");
+          let bytes: Uint8Array;
+          try {
+            bytes = await readBoundedResponse(response, 3 * 1024 * 1024, "El archivo de Supabase");
+          } catch {
+            return textResult("El archivo supera el límite de descarga MCP de 3 MiB. Usa una URL firmada o descárgalo desde Supabase.");
+          }
           return textResult(JSON.stringify({ ok: true, path: clean, contentType: response.headers.get("content-type") || "application/octet-stream", sizeBytes: bytes.byteLength, file_base64: Buffer.from(bytes).toString("base64") }));
         } catch (error) { return textResult("storage_download: " + (error instanceof Error ? error.message : String(error))); }
       }
@@ -466,9 +517,13 @@ const handler = createMcpHandler(
 
     // GitHub repository file tools. Configure GITHUB_TOKEN; writes require explicit confirmation.
     function githubConfig() {
-      const token = process.env.GITHUB_TOKEN;
+      const token = process.env.GITHUB_TOKEN?.trim();
       if (!token) throw new Error("Configura GITHUB_TOKEN en Vercel.");
-      return { token, repo: process.env.GITHUB_REPOSITORY || "jox123e/Kfldfl" };
+      const repo = process.env.GITHUB_REPOSITORY?.trim() || "jox123e/Kfldfl";
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+        throw new Error("GITHUB_REPOSITORY debe tener el formato propietario/repositorio.");
+      }
+      return { token, repo };
     }
     function safeRepoPath(value: string) {
       const path = value.replace(/^\/+/, "");
@@ -716,7 +771,8 @@ const handler = createMcpHandler(
 );
 
 async function guarded(req: Request) {
-  const configuredToken = process.env.MCP_AUTH_TOKEN?.trim();
+  // Accept either the raw secret or a copied "Bearer <secret>" value in Vercel.
+  const configuredToken = process.env.MCP_AUTH_TOKEN?.trim().replace(/^Bearer\s+/i, "").trim();
   const authorization = req.headers.get("authorization");
   const headerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const queryToken = new URL(req.url).searchParams.get("token")?.trim();
@@ -730,8 +786,11 @@ async function guarded(req: Request) {
     return new Response("Authorization token is missing.", { status: 401 });
   }
 
-  if (given !== configuredToken) {
-    return new Response("Authorization token mismatch.", { status: 401 });
+  const expectedBytes = Buffer.from(configuredToken, "utf8");
+  const givenBytes = Buffer.from(given, "utf8");
+  const matches = expectedBytes.length === givenBytes.length && timingSafeEqual(expectedBytes, givenBytes);
+  if (!matches) {
+    return new Response("Authorization token mismatch. Check that the client token matches MCP_AUTH_TOKEN; do not include the word Bearer in both places.", { status: 401 });
   }
 
   return handler(req);
