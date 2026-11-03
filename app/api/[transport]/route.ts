@@ -156,13 +156,16 @@ const handler = createMcpHandler(
           const endpoint =
             `https://apis.roblox.com/universes/v1/${encodeURIComponent(universeId)}/places/${encodeURIComponent(targetPlaceId)}/versions?versionType=Published`;
 
+          const requestBody = new ArrayBuffer(bytes.byteLength);
+          new Uint8Array(requestBody).set(bytes);
+
           const response = await fetch(endpoint, {
             method: "POST",
             headers: {
               "x-api-key": apiKey,
               "Content-Type": contentType,
             },
-            body: bytes,
+            body: requestBody,
             cache: "no-store",
             signal: AbortSignal.timeout(45000),
           });
