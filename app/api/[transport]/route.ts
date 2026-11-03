@@ -197,31 +197,40 @@ const handler = createMcpHandler(
 
     server.tool(
       "upload_model_asset",
-      "Crea un asset Model en Roblox usando Assets Open Cloud. Admite .rbxm y .rbxmx, crea el asset a nombre de un usuario o grupo y devuelve operationId para consultar el procesamiento con roblox_asset_operation. No publica una Place.",
+      "Crea un asset Model en Roblox usando Assets Open Cloud. Admite .rbxm y .rbxmx de hasta 10 MiB por file_url HTTPS público o 3 MiB por file_base64. Crea el asset a nombre de un usuario o grupo y devuelve operationId para consultar el procesamiento con roblox_asset_operation. No publica una Place.",
       {
         file_name: z.string().min(1).max(255).regex(/\.(rbxm|rbxmx)$/i),
-        file_base64: z.string().min(1),
+        file_base64: z.string().min(1).optional(),
+        file_url: z.string().url().optional(),
         display_name: z.string().min(1).max(50),
         description: z.string().max(1000).default(""),
         creator_user_id: z.string().regex(/^\d+$/).optional(),
         creator_group_id: z.string().regex(/^\d+$/).optional(),
       },
-      async ({ file_name, file_base64, display_name, description, creator_user_id, creator_group_id }) => {
+      async ({ file_name, file_base64, file_url, display_name, description, creator_user_id, creator_group_id }) => {
         try {
           const apiKey = process.env.ROBLOX_API_KEY;
           if (!apiKey) return textResult("Falta configurar ROBLOX_API_KEY en Vercel.");
           if (Boolean(creator_user_id) === Boolean(creator_group_id)) {
             return textResult("Debes indicar exactamente uno: creator_user_id o creator_group_id.");
           }
-          const maxBytes = 20 * 1024 * 1024;
-          if (file_base64.length > Math.ceil((maxBytes * 4) / 3) + 8 ||
-              !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64) ||
-              file_base64.length % 4 !== 0) {
-            return textResult("file_base64 no es válido o supera el límite de 20 MiB.");
+          if (Boolean(file_base64) === Boolean(file_url)) {
+            return textResult("Debes proporcionar exactamente uno: file_base64 o file_url.");
           }
-          const bytes = Buffer.from(file_base64, "base64");
-          if (!bytes.byteLength || bytes.byteLength > maxBytes) {
-            return textResult("El archivo debe pesar entre 1 byte y 20 MiB.");
+          let bytes: Uint8Array;
+          if (file_url) {
+            bytes = await downloadPlaceFile(file_url);
+          } else {
+            const maxInlineBytes = 3 * 1024 * 1024;
+            if (file_base64!.length > Math.ceil((maxInlineBytes * 4) / 3) + 8 ||
+                !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64!) ||
+                file_base64!.length % 4 !== 0) {
+              return textResult("file_base64 no es válido o supera el límite de 3 MiB. Usa file_url para archivos mayores.");
+            }
+            bytes = new Uint8Array(Buffer.from(file_base64!, "base64"));
+            if (!bytes.byteLength || bytes.byteLength > maxInlineBytes) {
+              return textResult("El archivo debe pesar entre 1 byte y 3 MiB usando file_base64.");
+            }
           }
           const name = file_name.toLowerCase();
           if (name.endsWith(".rbxmx")) {
