@@ -199,12 +199,12 @@ const handler = createMcpHandler(
       "upload_model_asset",
       "Crea un asset Model en Roblox usando Assets Open Cloud. Admite .rbxm y .rbxmx, crea el asset a nombre de un usuario o grupo y devuelve operationId para consultar el procesamiento con roblox_asset_operation. No publica una Place.",
       {
-        file_name: z.string().min(1).max(255).regex(/\\.(rbxm|rbxmx)$/i),
+        file_name: z.string().min(1).max(255).regex(/\.(rbxm|rbxmx)$/i),
         file_base64: z.string().min(1),
         display_name: z.string().min(1).max(50),
         description: z.string().max(1000).default(""),
-        creator_user_id: z.string().regex(/^\\d+$/).optional(),
-        creator_group_id: z.string().regex(/^\\d+$/).optional(),
+        creator_user_id: z.string().regex(/^\d+$/).optional(),
+        creator_group_id: z.string().regex(/^\d+$/).optional(),
       },
       async ({ file_name, file_base64, display_name, description, creator_user_id, creator_group_id }) => {
         try {
@@ -225,7 +225,7 @@ const handler = createMcpHandler(
           }
           const name = file_name.toLowerCase();
           if (name.endsWith(".rbxmx")) {
-            const prefix = new TextDecoder().decode(bytes.slice(0, 512)).replace(/^\\uFEFF/, "").trimStart();
+            const prefix = new TextDecoder().decode(bytes.slice(0, 512)).replace(/^\uFEFF/, "").trimStart();
             if (!prefix.startsWith("<?xml") && !prefix.startsWith("<roblox")) {
               return textResult("El archivo .rbxmx no parece ser XML de Roblox.");
             }
