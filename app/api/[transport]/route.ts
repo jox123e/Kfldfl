@@ -132,7 +132,7 @@ const handler = createMcpHandler(
         file_name: z.string().min(1).max(255),
         file_base64: z.string().optional(),
         file_url: z.string().url().optional(),
-        place_id: z.string().regex(/^\\d+$/).optional(),
+        place_id: z.string().regex(/^\d+$/).optional(),
       },
       async ({ file_name, file_base64, file_url, place_id }) => {
         try {
