@@ -195,10 +195,7 @@ const handler = createMcpHandler(
       }
     );
   },
-  {
-    name: "Roblox MCP",
-    version: "1.0.0",
-  },
+  {},
   {
     basePath: "/api",
     maxDuration: 60,
