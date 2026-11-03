@@ -409,7 +409,7 @@ const handler = createMcpHandler(
         "Analíticas y eventos: universe-analytics, universe-analytics-alert, universe-events, studio-evaluations.",
         "También se indicaron permisos legacy para assets, badges, developer-products, game-passes, groups, universes y users.",
         "",
-        "Usa roblox_api_request para llamar los endpoints oficiales. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
+        "Herramientas dedicadas: upload_place (.rbxl/.rbxlx), upload_model_asset (.rbxm/.rbxmx), roblox_asset_operation (seguimiento de carga). roblox_api_request permite explorar otros endpoints oficiales compatibles con API key. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
       ].join("\n"))
     );
   },
