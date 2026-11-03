@@ -262,15 +262,32 @@ const handler = createMcpHandler(
             responseData = responseText.slice(0, 12000);
           }
 
-          const serialized = JSON.stringify({
+          const result = {
             ok: response.ok,
             status: response.status,
             statusText: response.statusText,
             url: target.toString(),
             method,
             data: responseData,
-          });
-          return textResult(serialized.length > 16000 ? serialized.slice(0, 16000) + "… [respuesta truncada]" : serialized);
+          };
+
+          let serialized = JSON.stringify(result);
+          if (serialized.length > 16000) {
+            const preview = typeof responseData === "string"
+              ? responseData.slice(0, 12000)
+              : JSON.stringify(responseData).slice(0, 12000);
+            serialized = JSON.stringify({
+              ok: response.ok,
+              status: response.status,
+              statusText: response.statusText,
+              url: target.toString(),
+              method,
+              truncated: true,
+              dataPreview: preview,
+              message: "La respuesta original superó el límite de 16000 caracteres; se devuelve una vista previa JSON válida.",
+            });
+          }
+          return textResult(serialized);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return textResult("Error al llamar la API de Roblox: " + message);
