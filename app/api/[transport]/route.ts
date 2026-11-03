@@ -716,13 +716,22 @@ const handler = createMcpHandler(
 );
 
 async function guarded(req: Request) {
-  const token = process.env.MCP_AUTH_TOKEN;
-  const given =
-    req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ??
-    new URL(req.url).searchParams.get("token");
+  const configuredToken = process.env.MCP_AUTH_TOKEN?.trim();
+  const authorization = req.headers.get("authorization");
+  const headerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const queryToken = new URL(req.url).searchParams.get("token")?.trim();
+  const given = headerToken || queryToken;
 
-  if (!token || given !== token) {
-    return new Response("Unauthorized", { status: 401 });
+  if (!configuredToken) {
+    return new Response("MCP_AUTH_TOKEN is not configured for this deployment.", { status: 500 });
+  }
+
+  if (!given) {
+    return new Response("Authorization token is missing.", { status: 401 });
+  }
+
+  if (given !== configuredToken) {
+    return new Response("Authorization token mismatch.", { status: 401 });
   }
 
   return handler(req);
