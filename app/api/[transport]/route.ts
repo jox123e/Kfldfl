@@ -194,6 +194,107 @@ const handler = createMcpHandler(
         }
       }
     );
+
+    server.tool(
+      "roblox_api_request",
+      "Cliente general de Roblox Open Cloud y endpoints oficiales de Roblox. Permite usar los permisos de ROBLOX_API_KEY en APIs de universos, DataStores, Memory Stores, Luau Execution, assets, grupos, usuarios, inventario, mensajería, analíticas, eventos y otros servicios. Solo acepta HTTPS en dominios oficiales roblox.com. Para POST, PUT, PATCH o DELETE debes establecer confirm_write=true.",
+      {
+        url: z.string().url(),
+        method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+        query: z.record(z.string(), z.string()).optional(),
+        body: z.unknown().optional(),
+        confirm_write: z.boolean().optional(),
+      },
+      async ({ url, method, query, body, confirm_write }) => {
+        try {
+          const apiKey = process.env.ROBLOX_API_KEY;
+          if (!apiKey) return textResult("Falta configurar ROBLOX_API_KEY en Vercel.");
+
+          const target = new URL(url);
+          const host = target.hostname.toLowerCase();
+          if (
+            target.protocol !== "https:" ||
+            (host !== "roblox.com" && !host.endsWith(".roblox.com")) ||
+            target.username ||
+            target.password ||
+            (target.port && target.port !== "443") ||
+            target.hash
+          ) {
+            return textResult("URL rechazada. Solo se permiten URLs HTTPS de dominios oficiales *.roblox.com, sin credenciales ni puertos personalizados.");
+          }
+
+          if (method !== "GET" && confirm_write !== true) {
+            return textResult("Operación no ejecutada. Para autorizar una modificación, vuelve a llamar con confirm_write=true.");
+          }
+
+          if (query) {
+            for (const [key, value] of Object.entries(query)) {
+              target.searchParams.set(key, value);
+            }
+          }
+
+          let requestBody: string | undefined;
+          if (body !== undefined) {
+            requestBody = JSON.stringify(body);
+            if (new TextEncoder().encode(requestBody).byteLength > 1024 * 1024) {
+              return textResult("El cuerpo JSON supera el límite de 1 MiB.");
+            }
+          }
+
+          const response = await fetch(target, {
+            method,
+            headers: {
+              "x-api-key": apiKey,
+              "Accept": "application/json",
+              ...(requestBody !== undefined ? { "Content-Type": "application/json" } : {}),
+            },
+            ...(requestBody !== undefined ? { body: requestBody } : {}),
+            redirect: "error",
+            cache: "no-store",
+            signal: AbortSignal.timeout(30000),
+          });
+
+          const responseText = await response.text();
+          let responseData: unknown;
+          try {
+            responseData = responseText ? JSON.parse(responseText) : null;
+          } catch {
+            responseData = responseText.slice(0, 12000);
+          }
+
+          const serialized = JSON.stringify({
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            url: target.toString(),
+            method,
+            data: responseData,
+          });
+          return textResult(serialized.length > 16000 ? serialized.slice(0, 16000) + "… [respuesta truncada]" : serialized);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return textResult("Error al llamar la API de Roblox: " + message);
+        }
+      }
+    );
+
+    server.tool(
+      "roblox_api_capabilities",
+      "Muestra los grupos de permisos de la API key de Roblox que el usuario indicó que están habilitados. La API key real nunca se muestra.",
+      {},
+      async () => textResult([
+        "Permisos comunicados como activos por el usuario:",
+        "Assets y Creator Store: asset-permissions, assets, creator-store-products, creator-store-saves, thumbnails, universe-thumbnail.",
+        "Monetización: developer-products, game-passes, subscriptions.",
+        "Grupos y usuarios: groups, group-forums, users, inventory, user-restrictions, team-collaborations, followings.",
+        "Universos y Places: universe, universes, universe-places, universe-place-instances.",
+        "Datos y ejecución: universe-datastores, ordered-data-stores, memory-stores, messaging-service, luau-execution-sessions, secret-store.",
+        "Analíticas y eventos: universe-analytics, universe-analytics-alert, universe-events, studio-evaluations.",
+        "También se indicaron permisos legacy para assets, badges, developer-products, game-passes, groups, universes y users.",
+        "",
+        "Usa roblox_api_request para llamar los endpoints oficiales. Los permisos efectivos los valida Roblox; los endpoints legacy que requieran cookies no se vuelven compatibles con x-api-key por aparecer en la lista."
+      ].join("\n"))
+    );
   },
   {},
   {
