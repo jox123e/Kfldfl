@@ -2,6 +2,7 @@ import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { timingSafeEqual } from "node:crypto";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -11,6 +12,54 @@ const MAX_INLINE_BYTES = 3 * 1024 * 1024;
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
+}
+
+async function readBoundedResponse(response: Response, maxBytes: number, label: string): Promise<Uint8Array> {
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new Error(`${label} supera el límite de ${maxBytes} bytes.`);
+  }
+
+  if (!response.body) return new Uint8Array();
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`${label} supera el límite de ${maxBytes} bytes.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function decodeBase64Strict(value: string, maxBytes: number, label: string): Uint8Array {
+  if (!value || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error(`${label}: Base64 inválido.`);
+  }
+  const bytes = Buffer.from(value, "base64");
+  if (!bytes.byteLength || bytes.byteLength > maxBytes || bytes.toString("base64") !== value) {
+    throw new Error(`${label}: el archivo está vacío, supera el límite o tiene Base64 no canónico.`);
+  }
+  return new Uint8Array(bytes);
 }
 
 function isPrivateAddress(address: string): boolean {
@@ -81,28 +130,17 @@ async function downloadPlaceFile(fileUrl: string): Promise<Uint8Array> {
     throw new Error("El archivo supera el límite de 10 MiB.");
   }
 
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  const bytes = await readBoundedResponse(response, MAX_FILE_BYTES, "El archivo descargado");
   if (bytes.byteLength === 0) throw new Error("El archivo descargado está vacío.");
-  if (bytes.byteLength > MAX_FILE_BYTES) {
-    throw new Error("El archivo supera el límite de 10 MiB.");
-  }
   return bytes;
 }
 
 function decodeInlineFile(base64: string): Uint8Array {
-  if (base64.length > Math.ceil((MAX_INLINE_BYTES * 4) / 3) + 8) {
-    throw new Error("Para archivos mayores de 3 MiB, usa file_url con una URL HTTPS pública.");
+  try {
+    return decodeBase64Strict(base64, MAX_INLINE_BYTES, "file_base64");
+  } catch {
+    throw new Error("file_base64 no es válido, está vacío o supera 3 MiB. Usa file_url para archivos mayores.");
   }
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length % 4 !== 0) {
-    throw new Error("file_base64 no contiene Base64 válido.");
-  }
-
-  const bytes = Buffer.from(base64, "base64");
-  if (bytes.byteLength === 0) throw new Error("El archivo está vacío.");
-  if (bytes.byteLength > MAX_INLINE_BYTES) {
-    throw new Error("La carga Base64 está limitada a 3 MiB; usa file_url para archivos mayores.");
-  }
-  return new Uint8Array(bytes);
 }
 
 function validatePlaceFile(fileName: string, bytes: Uint8Array): "application/xml" | "application/octet-stream" {
@@ -221,15 +259,10 @@ const handler = createMcpHandler(
           if (file_url) {
             bytes = await downloadPlaceFile(file_url);
           } else {
-            const maxInlineBytes = 3 * 1024 * 1024;
-            if (file_base64!.length > Math.ceil((maxInlineBytes * 4) / 3) + 8 ||
-                !/^[A-Za-z0-9+/]*={0,2}$/.test(file_base64!) ||
-                file_base64!.length % 4 !== 0) {
-              return textResult("file_base64 no es válido o supera el límite de 3 MiB. Usa file_url para archivos mayores.");
-            }
-            bytes = new Uint8Array(Buffer.from(file_base64!, "base64"));
-            if (!bytes.byteLength || bytes.byteLength > maxInlineBytes) {
-              return textResult("El archivo debe pesar entre 1 byte y 3 MiB usando file_base64.");
+            try {
+              bytes = decodeBase64Strict(file_base64!, MAX_INLINE_BYTES, "file_base64");
+            } catch {
+              return textResult("file_base64 no es válido, está vacío o supera 3 MiB. Usa file_url para archivos mayores.");
             }
           }
           const name = file_name.toLowerCase();
@@ -301,6 +334,314 @@ const handler = createMcpHandler(
           const message = error instanceof Error ? error.message : String(error);
           return textResult("Error consultando la operación del asset: " + message);
         }
+      }
+    );
+
+
+    // Persistent Supabase Storage tools. Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.
+    function storageConfig() {
+      const base = process.env.SUPABASE_URL;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (!base || !key) throw new Error("Configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en Vercel.");
+      const parsed = new URL(base);
+      if (
+        parsed.protocol !== "https:" ||
+        !/^[a-z0-9-]+\.supabase\.co$/i.test(parsed.hostname) ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        (parsed.pathname !== "/" && parsed.pathname !== "") ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        throw new Error("SUPABASE_URL debe ser el origen HTTPS de un proyecto *.supabase.co, sin ruta, credenciales ni parámetros.");
+      }
+      const bucket = process.env.SUPABASE_STORAGE_BUCKET?.trim() || "mcp-files";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(bucket)) {
+        throw new Error("SUPABASE_STORAGE_BUCKET contiene un nombre inválido.");
+      }
+      return { base: parsed.origin, key: key.trim(), bucket };
+    }
+    function safeStoragePath(value: string) {
+      const path = value.replace(/^\/+/, "");
+      if (!path || path.length > 900 || path.split("/").some(part => !part || part === "." || part === "..")) {
+        throw new Error("Ruta de archivo inválida.");
+      }
+      return path;
+    }
+    async function storageRequest(path: string, init: RequestInit = {}) {
+      const cfg = storageConfig();
+      const response = await fetch(cfg.base + "/storage/v1" + path, {
+        ...init,
+        headers: {
+          "apikey": cfg.key,
+          "Authorization": "Bearer " + cfg.key,
+          ...(init.headers || {}),
+        },
+        cache: "no-store",
+        redirect: "error",
+        signal: AbortSignal.timeout(30000),
+      });
+      const raw = await response.text();
+      let data: unknown;
+      try { data = raw ? JSON.parse(raw) : null; } catch { data = raw.slice(0, 4000); }
+      if (!response.ok) throw new Error("Supabase Storage HTTP " + response.status + ": " + JSON.stringify(data).slice(0, 3000));
+      return data;
+    }
+
+    server.tool(
+      "storage_upload",
+      "Guarda un archivo de forma persistente en el bucket privado de Supabase. Acepta Base64 de hasta 5 MiB y una ruta relativa.",
+      {
+        path: z.string().min(1).max(900),
+        file_base64: z.string().min(1),
+        content_type: z.string().max(150).default("application/octet-stream"),
+        overwrite: z.boolean().default(false),
+      },
+      async ({ path, file_base64, content_type, overwrite }) => {
+        try {
+          const clean = safeStoragePath(path);
+          let bytes: Uint8Array;
+          try {
+            bytes = decodeBase64Strict(file_base64, 5 * 1024 * 1024, "file_base64");
+          } catch {
+            return textResult("Base64 inválido, vacío o demasiado grande (máximo 5 MiB).");
+          }
+          const cfg = storageConfig();
+          const objectPath = clean.split("/").map(encodeURIComponent).join("/");
+          const result = await storageRequest("/object/" + encodeURIComponent(cfg.bucket) + "/" + objectPath, {
+            method: "POST",
+            headers: { "Content-Type": content_type, "x-upsert": String(overwrite) },
+            body: new Uint8Array(bytes),
+          });
+          return textResult(JSON.stringify({ ok: true, bucket: cfg.bucket, path: clean, sizeBytes: bytes.length, result }));
+        } catch (error) { return textResult("storage_upload: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "storage_download",
+      "Descarga un archivo del almacenamiento persistente y devuelve su contenido en Base64. Máximo 3 MiB para evitar respuestas MCP excesivas.",
+      { path: z.string().min(1).max(900) },
+      async ({ path }) => {
+        try {
+          const clean = safeStoragePath(path);
+          const cfg = storageConfig();
+          const objectPath = clean.split("/").map(encodeURIComponent).join("/");
+          const response = await fetch(cfg.base + "/storage/v1/object/" + encodeURIComponent(cfg.bucket) + "/" + objectPath, {
+            headers: { apikey: cfg.key, Authorization: "Bearer " + cfg.key },
+            cache: "no-store", redirect: "error", signal: AbortSignal.timeout(30000),
+          });
+          if (!response.ok) return textResult("Supabase Storage HTTP " + response.status + ".");
+          let bytes: Uint8Array;
+          try {
+            bytes = await readBoundedResponse(response, 3 * 1024 * 1024, "El archivo de Supabase");
+          } catch {
+            return textResult("El archivo supera el límite de descarga MCP de 3 MiB. Usa una URL firmada o descárgalo desde Supabase.");
+          }
+          return textResult(JSON.stringify({ ok: true, path: clean, contentType: response.headers.get("content-type") || "application/octet-stream", sizeBytes: bytes.byteLength, file_base64: Buffer.from(bytes).toString("base64") }));
+        } catch (error) { return textResult("storage_download: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "storage_list",
+      "Lista archivos del bucket privado de Supabase bajo un prefijo opcional.",
+      { prefix: z.string().max(900).default(""), limit: z.number().int().min(1).max(100).default(100), offset: z.number().int().min(0).default(0) },
+      async ({ prefix, limit, offset }) => {
+        try {
+          const cleanPrefix = prefix ? safeStoragePath(prefix) : "";
+          const cfg = storageConfig();
+          const data = await storageRequest("/object/list/" + encodeURIComponent(cfg.bucket), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prefix: cleanPrefix, limit, offset, sortBy: { column: "name", order: "asc" } }),
+          });
+          return textResult(JSON.stringify({ ok: true, bucket: cfg.bucket, prefix: cleanPrefix, files: data }));
+        } catch (error) { return textResult("storage_list: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "storage_delete",
+      "Elimina permanentemente uno o varios archivos del bucket privado. Requiere confirm_delete=true.",
+      { paths: z.array(z.string().min(1).max(900)).min(1).max(100), confirm_delete: z.boolean() },
+      async ({ paths, confirm_delete }) => {
+        try {
+          if (!confirm_delete) return textResult("No se eliminó nada. Repite con confirm_delete=true.");
+          const cfg = storageConfig();
+          const clean = paths.map(safeStoragePath);
+          const data = await storageRequest("/object/" + encodeURIComponent(cfg.bucket), {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prefixes: clean }),
+          });
+          return textResult(JSON.stringify({ ok: true, deleted: clean, result: data }));
+        } catch (error) { return textResult("storage_delete: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "storage_move",
+      "Mueve o renombra un archivo dentro del mismo bucket privado.",
+      { from_path: z.string().min(1).max(900), to_path: z.string().min(1).max(900), overwrite: z.boolean().default(false) },
+      async ({ from_path, to_path, overwrite }) => {
+        try {
+          const cfg = storageConfig();
+          const from = safeStoragePath(from_path), to = safeStoragePath(to_path);
+          const data = await storageRequest("/object/move", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bucketId: cfg.bucket, sourceKey: from, destinationKey: to, destinationBucket: cfg.bucket, upsert: overwrite }),
+          });
+          return textResult(JSON.stringify({ ok: true, from, to, result: data }));
+        } catch (error) { return textResult("storage_move: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "storage_copy",
+      "Copia un archivo dentro del mismo bucket privado.",
+      { from_path: z.string().min(1).max(900), to_path: z.string().min(1).max(900), overwrite: z.boolean().default(false) },
+      async ({ from_path, to_path, overwrite }) => {
+        try {
+          const cfg = storageConfig();
+          const from = safeStoragePath(from_path), to = safeStoragePath(to_path);
+          const data = await storageRequest("/object/copy", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bucketId: cfg.bucket, sourceKey: from, destinationKey: to, destinationBucket: cfg.bucket, upsert: overwrite }),
+          });
+          return textResult(JSON.stringify({ ok: true, from, to, result: data }));
+        } catch (error) { return textResult("storage_copy: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    // GitHub repository file tools. Configure GITHUB_TOKEN; writes require explicit confirmation.
+    function githubConfig() {
+      const token = process.env.GITHUB_TOKEN?.trim();
+      if (!token) throw new Error("Configura GITHUB_TOKEN en Vercel.");
+      const repo = process.env.GITHUB_REPOSITORY?.trim() || "jox123e/Kfldfl";
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+        throw new Error("GITHUB_REPOSITORY debe tener el formato propietario/repositorio.");
+      }
+      return { token, repo };
+    }
+    function safeRepoPath(value: string) {
+      const path = value.replace(/^\/+/, "");
+      if (!path || path.length > 900 || path.split("/").some(part => !part || part === "." || part === "..")) throw new Error("Ruta de repositorio inválida.");
+      return path;
+    }
+    async function githubRequest(path: string, init: RequestInit = {}) {
+      const cfg = githubConfig();
+      const response = await fetch("https://api.github.com/repos/" + cfg.repo + path, {
+        ...init,
+        headers: { Accept: "application/vnd.github+json", Authorization: "Bearer " + cfg.token, "X-GitHub-Api-Version": "2022-11-28", ...(init.headers || {}) },
+        cache: "no-store", redirect: "error", signal: AbortSignal.timeout(25000),
+      });
+      const raw = await response.text();
+      let data: any;
+      try { data = raw ? JSON.parse(raw) : null; } catch { data = raw.slice(0, 4000); }
+      if (!response.ok) throw new Error("GitHub HTTP " + response.status + ": " + JSON.stringify(data).slice(0, 2500));
+      return data;
+    }
+
+    server.tool(
+      "github_file_read",
+      "Lee un archivo del repositorio GitHub configurado. Devuelve texto y SHA del contenido.",
+      { path: z.string().min(1).max(900), branch: z.string().max(255).default("main") },
+      async ({ path, branch }) => {
+        try {
+          const data = await githubRequest("/contents/" + safeRepoPath(path).split("/").map(encodeURIComponent).join("/") + "?ref=" + encodeURIComponent(branch));
+          if (Array.isArray(data) || data.type !== "file") return textResult("La ruta no es un archivo individual.");
+          const decoded = Buffer.from(String(data.content || "").replace(/\n/g, ""), "base64").toString("utf8");
+          return textResult(JSON.stringify({ ok: true, path, branch, sha: data.sha, content: decoded }));
+        } catch (error) { return textResult("github_file_read: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "github_file_write",
+      "Crea o reemplaza un archivo en GitHub. Requiere confirm_write=true. Para actualizar, proporciona el SHA actual obtenido con github_file_read.",
+      { path: z.string().min(1).max(900), content: z.string().max(500000), message: z.string().min(1).max(200), branch: z.string().max(255).default("main"), sha: z.string().optional(), confirm_write: z.boolean() },
+      async ({ path, content, message, branch, sha, confirm_write }) => {
+        try {
+          if (!confirm_write) return textResult("No se escribió nada. Repite con confirm_write=true.");
+          const clean = safeRepoPath(path);
+          const data = await githubRequest("/contents/" + clean.split("/").map(encodeURIComponent).join("/"), {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message, content: Buffer.from(content, "utf8").toString("base64"), branch, ...(sha ? { sha } : {}) }),
+          });
+          return textResult(JSON.stringify({ ok: true, path: clean, branch, commit: data.commit?.sha, contentSha: data.content?.sha }));
+        } catch (error) { return textResult("github_file_write: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "github_file_delete",
+      "Elimina un archivo de GitHub. Requiere el SHA actual y confirm_delete=true.",
+      { path: z.string().min(1).max(900), sha: z.string().min(1), message: z.string().min(1).max(200), branch: z.string().max(255).default("main"), confirm_delete: z.boolean() },
+      async ({ path, sha, message, branch, confirm_delete }) => {
+        try {
+          if (!confirm_delete) return textResult("No se eliminó nada. Repite con confirm_delete=true.");
+          const data = await githubRequest("/contents/" + safeRepoPath(path).split("/").map(encodeURIComponent).join("/"), {
+            method: "DELETE", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message, sha, branch }),
+          });
+          return textResult(JSON.stringify({ ok: true, path, branch, commit: data.commit?.sha }));
+        } catch (error) { return textResult("github_file_delete: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "github_repo_tree",
+      "Lista el árbol de archivos de una rama del repositorio GitHub configurado.",
+      { branch: z.string().max(255).default("main"), path_prefix: z.string().max(900).default("") },
+      async ({ branch, path_prefix }) => {
+        try {
+          const ref = await githubRequest("/git/ref/heads/" + encodeURIComponent(branch));
+          const tree = await githubRequest("/git/trees/" + encodeURIComponent(ref.object.sha) + "?recursive=1");
+          const prefix = path_prefix ? safeRepoPath(path_prefix).replace(/\/$/, "") + "/" : "";
+          const entries = (tree.tree || []).filter((entry: any) => !prefix || entry.path.startsWith(prefix)).map((entry: any) => ({ path: entry.path, type: entry.type, size: entry.size, sha: entry.sha }));
+          return textResult(JSON.stringify({ ok: true, branch, truncated: tree.truncated, entries: entries.slice(0, 1000) }));
+        } catch (error) { return textResult("github_repo_tree: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    // Roblox place metadata tools use documented Creator Hub endpoints.
+    server.tool(
+      "roblox_list_places",
+      "Lista los Places de un universo usando el endpoint público documentado de Roblox. Permite paginación mediante cursor.",
+      { universe_id: z.string().regex(/^\d+$/).optional(), limit: z.number().int().min(10).max(100).default(100), cursor: z.string().optional() },
+      async ({ universe_id, limit, cursor }) => {
+        try {
+          const id = universe_id || process.env.ROBLOX_UNIVERSE_ID;
+          if (!id) return textResult("Indica universe_id o configura ROBLOX_UNIVERSE_ID.");
+          const url = new URL("https://develop.roblox.com/v1/universes/" + encodeURIComponent(id) + "/places");
+          url.searchParams.set("limit", String(limit));
+          if (cursor) url.searchParams.set("cursor", cursor);
+          const response = await fetch(url, { cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20000) });
+          const raw = await response.text();
+          let data: unknown; try { data = raw ? JSON.parse(raw) : null; } catch { data = raw.slice(0, 5000); }
+          return textResult(JSON.stringify({ ok: response.ok, status: response.status, universeId: id, data }));
+        } catch (error) { return textResult("roblox_list_places: " + (error instanceof Error ? error.message : String(error))); }
+      }
+    );
+
+    server.tool(
+      "roblox_get_place",
+      "Obtiene metadatos de un Place mediante Roblox Open Cloud v2.",
+      { place_id: z.string().regex(/^\d+$/), universe_id: z.string().regex(/^\d+$/).optional() },
+      async ({ place_id, universe_id }) => {
+        try {
+          const id = universe_id || process.env.ROBLOX_UNIVERSE_ID;
+          const key = process.env.ROBLOX_API_KEY;
+          if (!id || !key) return textResult("Configura ROBLOX_UNIVERSE_ID y ROBLOX_API_KEY o proporciona universe_id.");
+          const response = await fetch("https://apis.roblox.com/cloud/v2/universes/" + encodeURIComponent(id) + "/places/" + encodeURIComponent(place_id), {
+            headers: { "x-api-key": key, Accept: "application/json" }, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20000),
+          });
+          const raw = await response.text();
+          let data: unknown; try { data = raw ? JSON.parse(raw) : null; } catch { data = raw.slice(0, 5000); }
+          return textResult(JSON.stringify({ ok: response.ok, status: response.status, data }));
+        } catch (error) { return textResult("roblox_get_place: " + (error instanceof Error ? error.message : String(error))); }
       }
     );
 
@@ -430,13 +771,26 @@ const handler = createMcpHandler(
 );
 
 async function guarded(req: Request) {
-  const token = process.env.MCP_AUTH_TOKEN;
-  const given =
-    req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ??
-    new URL(req.url).searchParams.get("token");
+  // Accept either the raw secret or a copied "Bearer <secret>" value in Vercel.
+  const configuredToken = process.env.MCP_AUTH_TOKEN?.trim().replace(/^Bearer\s+/i, "").trim();
+  const authorization = req.headers.get("authorization");
+  const headerToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const queryToken = new URL(req.url).searchParams.get("token")?.trim();
+  const given = headerToken || queryToken;
 
-  if (!token || given !== token) {
-    return new Response("Unauthorized", { status: 401 });
+  if (!configuredToken) {
+    return new Response("MCP_AUTH_TOKEN is not configured for this deployment.", { status: 500 });
+  }
+
+  if (!given) {
+    return new Response("Authorization token is missing.", { status: 401 });
+  }
+
+  const expectedBytes = Buffer.from(configuredToken, "utf8");
+  const givenBytes = Buffer.from(given, "utf8");
+  const matches = expectedBytes.length === givenBytes.length && timingSafeEqual(expectedBytes, givenBytes);
+  if (!matches) {
+    return new Response("Authorization token mismatch. Check that the client token matches MCP_AUTH_TOKEN; do not include the word Bearer in both places.", { status: 401 });
   }
 
   return handler(req);
